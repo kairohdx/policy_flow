@@ -19,9 +19,11 @@ class FirstMatch(Generic[EffectT]):
     def should_stop(self, result: RuleResult[EffectT]) -> bool:
         return result.outcome.terminal
 
-    def select(
+    def selected_indices(
         self,
         results: list[RuleResult[EffectT]],
-    ) -> RuleResult[EffectT] | None:
-        return next((result for result in results if result.outcome.terminal), None)
-
+    ) -> tuple[int, ...]:
+        for index, result in enumerate(results):
+            if result.outcome.terminal:
+                return (index,)
+        return ()

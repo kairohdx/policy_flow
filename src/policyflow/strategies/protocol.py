@@ -17,9 +17,8 @@ class ResolutionStrategy(Protocol[EffectT]):
     def should_stop(self, result: RuleResult[EffectT]) -> bool:
         ...
 
-    def select(
+    def selected_indices(
         self,
         results: list[RuleResult[EffectT]],
-    ) -> RuleResult[EffectT] | None:
+    ) -> tuple[int, ...]:
         ...
-
