@@ -49,11 +49,11 @@ class PolicyEngine(Generic[ContextT, EffectT]):
         """Run synchronous rules. Use arun() when any rule is asynchronous."""
         collector = self._start_trace(trace_context, trace_attributes)
         try:
-            decision = self._run_sync(context, tuple(scopes), collector)
+            decisions = self._run_sync(context, tuple(scopes), collector)
         except Exception as exc:
             self._record_failure(collector, exc)
             raise
-        return self._complete(collector, decision)
+        return self._complete(collector, decisions)
 
     async def arun(
         self,
@@ -66,11 +66,11 @@ class PolicyEngine(Generic[ContextT, EffectT]):
         """Run synchronous and asynchronous rules."""
         collector = self._start_trace(trace_context, trace_attributes)
         try:
-            decision = await self._run_async(context, tuple(scopes), collector)
+            decisions = await self._run_async(context, tuple(scopes), collector)
         except Exception as exc:
             self._record_failure(collector, exc)
             raise
-        return self._complete(collector, decision)
+        return self._complete(collector, decisions)
 
     def _start_trace(
         self,
@@ -109,7 +109,7 @@ class PolicyEngine(Generic[ContextT, EffectT]):
         context: ContextT,
         scopes: tuple[Hashable, ...],
         collector: TraceCollector,
-    ) -> Decision[EffectT] | None:
+    ) -> tuple[Decision[EffectT], ...]:
         for scope in scopes:
             definition = self._registry.get(scope)
             collector.emit(
@@ -144,7 +144,7 @@ class PolicyEngine(Generic[ContextT, EffectT]):
                 if definition.strategy.should_stop(result):
                     break
 
-            decision = self._resolve(
+            decisions = self._resolve(
                 scope,
                 definition.strategy,
                 results,
@@ -154,19 +154,19 @@ class PolicyEngine(Generic[ContextT, EffectT]):
                 "scope.exited",
                 attributes={
                     "scope": str(scope),
-                    "decision": decision is not None,
+                    "decision_count": len(decisions),
                 },
             )
-            if decision is not None:
-                return decision
-        return None
+            if decisions:
+                return decisions
+        return ()
 
     async def _run_async(
         self,
         context: ContextT,
         scopes: tuple[Hashable, ...],
         collector: TraceCollector,
-    ) -> Decision[EffectT] | None:
+    ) -> tuple[Decision[EffectT], ...]:
         for scope in scopes:
             definition = self._registry.get(scope)
             collector.emit(
@@ -196,7 +196,7 @@ class PolicyEngine(Generic[ContextT, EffectT]):
                 if definition.strategy.should_stop(result):
                     break
 
-            decision = self._resolve(
+            decisions = self._resolve(
                 scope,
                 definition.strategy,
                 results,
@@ -206,12 +206,12 @@ class PolicyEngine(Generic[ContextT, EffectT]):
                 "scope.exited",
                 attributes={
                     "scope": str(scope),
-                    "decision": decision is not None,
+                    "decision_count": len(decisions),
                 },
             )
-            if decision is not None:
-                return decision
-        return None
+            if decisions:
+                return decisions
+        return ()
 
     @staticmethod
     def _validate_result(rule_id: str, result: object) -> RuleResult[EffectT]:
@@ -253,9 +253,11 @@ class PolicyEngine(Generic[ContextT, EffectT]):
         strategy: ResolutionStrategy[EffectT],
         results: list[tuple[str, RuleResult[EffectT]]],
         collector: TraceCollector,
-    ) -> Decision[EffectT] | None:
-        selected = strategy.select([result for _, result in results])
-        if selected is None:
+    ) -> tuple[Decision[EffectT], ...]:
+        selected_indices = strategy.selected_indices(
+            [result for _, result in results]
+        )
+        if not selected_indices:
             collector.emit(
                 "resolution.no_match",
                 attributes={
@@ -264,10 +266,15 @@ class PolicyEngine(Generic[ContextT, EffectT]):
                     "evaluated_rules": len(results),
                 },
             )
-            return None
+            return ()
 
-        selected_rule_id = next(
-            rule_id for rule_id, result in results if result is selected
+        decisions = tuple(
+            Decision(
+                rule_id=results[index][0],
+                scope=scope,
+                result=results[index][1],
+            )
+            for index in selected_indices
         )
         collector.emit(
             "resolution.completed",
@@ -275,20 +282,26 @@ class PolicyEngine(Generic[ContextT, EffectT]):
                 "scope": str(scope),
                 "strategy": strategy.name,
                 "evaluated_rules": len(results),
-                "selected_rule": selected_rule_id,
-                "outcome": selected.outcome.value,
+                "decision_count": len(decisions),
+                "selected_rules": [decision.rule_id for decision in decisions],
+                "outcomes": [
+                    decision.outcome.value
+                    for decision in decisions
+                ],
             },
         )
-        if selected.effect is not None:
+        for decision in decisions:
+            if decision.effect is None:
+                continue
             collector.emit(
                 "effect.proposed",
                 attributes={
                     "scope": str(scope),
-                    "rule_id": selected_rule_id,
-                    "effect_type": type(selected.effect).__name__,
+                    "rule_id": decision.rule_id,
+                    "effect_type": type(decision.effect).__name__,
                 },
             )
-        return Decision(selected_rule_id, scope, selected)
+        return decisions
 
     @staticmethod
     def _record_failure(collector: TraceCollector, exc: Exception) -> None:
@@ -304,18 +317,25 @@ class PolicyEngine(Generic[ContextT, EffectT]):
     @staticmethod
     def _complete(
         collector: TraceCollector,
-        decision: Decision[EffectT] | None,
+        decisions: tuple[Decision[EffectT], ...],
     ) -> Execution[EffectT]:
         attributes: dict[str, JsonValue] = {
-            "matched": decision is not None,
+            "matched": bool(decisions),
+            "decision_count": len(decisions),
         }
-        if decision is not None:
+        if decisions:
             attributes.update(
                 {
-                    "scope": str(decision.scope),
-                    "selected_rule": decision.rule_id,
-                    "outcome": decision.outcome.value,
+                    "scope": str(decisions[0].scope),
+                    "selected_rules": [
+                        decision.rule_id
+                        for decision in decisions
+                    ],
+                    "outcomes": [
+                        decision.outcome.value
+                        for decision in decisions
+                    ],
                 }
             )
         collector.emit("execution.completed", attributes=attributes)
-        return Execution(decision=decision, trace=collector.finish("completed"))
+        return Execution(decisions=decisions, trace=collector.finish("completed"))

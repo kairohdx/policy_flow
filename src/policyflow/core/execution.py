@@ -32,5 +32,10 @@ class Decision(Generic[EffectT]):
 
 @dataclass(frozen=True, slots=True)
 class Execution(Generic[EffectT]):
-    decision: Decision[EffectT] | None
+    decisions: tuple[Decision[EffectT], ...]
     trace: ExecutionTrace
+
+    @property
+    def decision(self) -> Decision[EffectT] | None:
+        """Backward-compatible shortcut to the first selected decision."""
+        return self.decisions[0] if self.decisions else None
