@@ -54,6 +54,31 @@ for decision in execution.decisions:
 `execution.decision` permanece como um atalho para a primeira decisão. Códigos
 que utilizam estratégias de coleta devem acessar `execution.decisions`.
 
+## Percurso entre scopes
+
+A estratégia configurada em `add_scope()` resolve resultados de regras dentro
+daquele scope. Separadamente, uma estratégia de percurso controla se o engine
+encerra após um scope produzir decisões ou continua avaliando os demais.
+
+Por padrão, `run()` e `arun()` preservam o comportamento de encerrar no
+primeiro scope resolvido. Use `CollectResolvedScopes` para acumular decisões de
+todos os scopes solicitados:
+
+```python
+from policyflow import CollectResolvedScopes
+
+execution = engine.run(
+    context,
+    scopes=["scope-a", "scope-b"],
+    traversal=CollectResolvedScopes(),
+)
+```
+
+Scopes sem decisões são ignorados. As decisões são preservadas na ordem dos
+scopes e, dentro de cada scope, na ordem selecionada por sua
+`ResolutionStrategy`. O PolicyFlow apenas produz decisões; a aplicação continua
+responsável por executar seus efeitos.
+
 ## Exemplos executáveis
 
 Os exemplos não dependem de serviços externos:

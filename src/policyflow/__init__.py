@@ -23,13 +23,21 @@ from .observability import (
     TraceContext,
 )
 from .rules import Rule, rule
-from .strategies import CollectAll, FirstMatch, ResolutionStrategy
+from .strategies import (
+    CollectAll,
+    CollectResolvedScopes,
+    FirstMatch,
+    ResolutionStrategy,
+    ScopeTraversalStrategy,
+    StopOnFirstResolvedScope,
+)
 
 __all__ = [
     "AsyncEventSink",
     "AsyncRuleInSyncExecutionError",
     "ConfigurationError",
     "CollectAll",
+    "CollectResolvedScopes",
     "Decision",
     "DuplicateRuleError",
     "DuplicateScopeError",
@@ -47,6 +55,8 @@ __all__ = [
     "RuleOutcome",
     "RuleResult",
     "ScopeNotFoundError",
+    "ScopeTraversalStrategy",
+    "StopOnFirstResolvedScope",
     "TraceContext",
     "rule",
 ]

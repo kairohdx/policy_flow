@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Generic, Hashable, TypeVar, cast
 
 from policyflow.core.exceptions import (
@@ -16,10 +17,23 @@ from policyflow.observability.collector import TraceCollector
 from policyflow.observability.context import TraceContext
 from policyflow.scopes.registry import ScopeRegistry
 from policyflow.strategies.protocol import ResolutionStrategy
+from policyflow.strategies.scope_traversal import ScopeTraversalStrategy
+from policyflow.strategies.stop_on_first_resolved_scope import (
+    StopOnFirstResolvedScope,
+)
 from policyflow.typing import JsonValue
 
 ContextT = TypeVar("ContextT")
 EffectT = TypeVar("EffectT")
+
+
+@dataclass(frozen=True, slots=True)
+class _TraversalResult(Generic[EffectT]):
+    decisions: tuple[Decision[EffectT], ...]
+    evaluated_scopes: tuple[Hashable, ...]
+    resolved_scopes: tuple[Hashable, ...]
+
+
 class PolicyEngine(Generic[ContextT, EffectT]):
     """Execute typed rules from explicitly selected scopes."""
 
@@ -43,37 +57,62 @@ class PolicyEngine(Generic[ContextT, EffectT]):
         context: ContextT,
         *,
         scopes: Iterable[Hashable],
+        traversal: ScopeTraversalStrategy[EffectT] | None = None,
         trace_context: TraceContext | None = None,
         trace_attributes: Mapping[str, JsonValue] | None = None,
     ) -> Execution[EffectT]:
         """Run synchronous rules. Use arun() when any rule is asynchronous."""
-        collector = self._start_trace(trace_context, trace_attributes)
+        if traversal is None:
+            traversal = StopOnFirstResolvedScope()
+        collector = self._start_trace(
+            traversal,
+            trace_context,
+            trace_attributes,
+        )
         try:
-            decisions = self._run_sync(context, tuple(scopes), collector)
+            result = self._run_sync(
+                context,
+                tuple(scopes),
+                traversal,
+                collector,
+            )
         except Exception as exc:
             self._record_failure(collector, exc)
             raise
-        return self._complete(collector, decisions)
+        return self._complete(collector, traversal, result)
 
     async def arun(
         self,
         context: ContextT,
         *,
         scopes: Iterable[Hashable],
+        traversal: ScopeTraversalStrategy[EffectT] | None = None,
         trace_context: TraceContext | None = None,
         trace_attributes: Mapping[str, JsonValue] | None = None,
     ) -> Execution[EffectT]:
         """Run synchronous and asynchronous rules."""
-        collector = self._start_trace(trace_context, trace_attributes)
+        if traversal is None:
+            traversal = StopOnFirstResolvedScope()
+        collector = self._start_trace(
+            traversal,
+            trace_context,
+            trace_attributes,
+        )
         try:
-            decisions = await self._run_async(context, tuple(scopes), collector)
+            result = await self._run_async(
+                context,
+                tuple(scopes),
+                traversal,
+                collector,
+            )
         except Exception as exc:
             self._record_failure(collector, exc)
             raise
-        return self._complete(collector, decisions)
+        return self._complete(collector, traversal, result)
 
     def _start_trace(
         self,
+        traversal: ScopeTraversalStrategy[EffectT],
         trace_context: TraceContext | None,
         trace_attributes: Mapping[str, JsonValue] | None,
     ) -> TraceCollector:
@@ -86,6 +125,7 @@ class PolicyEngine(Generic[ContextT, EffectT]):
             "execution.started",
             attributes={
                 "pipeline": self.name,
+                "traversal_strategy": traversal.name,
                 **self._trace_context_attributes(trace_context),
             },
         )
@@ -108,10 +148,15 @@ class PolicyEngine(Generic[ContextT, EffectT]):
         self,
         context: ContextT,
         scopes: tuple[Hashable, ...],
+        traversal: ScopeTraversalStrategy[EffectT],
         collector: TraceCollector,
-    ) -> tuple[Decision[EffectT], ...]:
+    ) -> _TraversalResult[EffectT]:
+        accumulated: list[Decision[EffectT]] = []
+        evaluated_scopes: list[Hashable] = []
+        resolved_scopes: list[Hashable] = []
         for scope in scopes:
             definition = self._registry.get(scope)
+            evaluated_scopes.append(scope)
             collector.emit(
                 "scope.entered",
                 attributes={
@@ -150,25 +195,34 @@ class PolicyEngine(Generic[ContextT, EffectT]):
                 results,
                 collector,
             )
-            collector.emit(
-                "scope.exited",
-                attributes={
-                    "scope": str(scope),
-                    "decision_count": len(decisions),
-                },
-            )
-            if decisions:
-                return decisions
-        return ()
+            self._record_scope_exit(collector, scope, decisions)
+            if self._advance_traversal(
+                traversal,
+                scope,
+                decisions,
+                accumulated,
+                resolved_scopes,
+            ):
+                break
+        return _TraversalResult(
+            decisions=tuple(accumulated),
+            evaluated_scopes=tuple(evaluated_scopes),
+            resolved_scopes=tuple(resolved_scopes),
+        )
 
     async def _run_async(
         self,
         context: ContextT,
         scopes: tuple[Hashable, ...],
+        traversal: ScopeTraversalStrategy[EffectT],
         collector: TraceCollector,
-    ) -> tuple[Decision[EffectT], ...]:
+    ) -> _TraversalResult[EffectT]:
+        accumulated: list[Decision[EffectT]] = []
+        evaluated_scopes: list[Hashable] = []
+        resolved_scopes: list[Hashable] = []
         for scope in scopes:
             definition = self._registry.get(scope)
+            evaluated_scopes.append(scope)
             collector.emit(
                 "scope.entered",
                 attributes={
@@ -202,16 +256,53 @@ class PolicyEngine(Generic[ContextT, EffectT]):
                 results,
                 collector,
             )
-            collector.emit(
-                "scope.exited",
-                attributes={
-                    "scope": str(scope),
-                    "decision_count": len(decisions),
-                },
-            )
-            if decisions:
-                return decisions
-        return ()
+            self._record_scope_exit(collector, scope, decisions)
+            if self._advance_traversal(
+                traversal,
+                scope,
+                decisions,
+                accumulated,
+                resolved_scopes,
+            ):
+                break
+        return _TraversalResult(
+            decisions=tuple(accumulated),
+            evaluated_scopes=tuple(evaluated_scopes),
+            resolved_scopes=tuple(resolved_scopes),
+        )
+
+    @staticmethod
+    def _advance_traversal(
+        traversal: ScopeTraversalStrategy[EffectT],
+        scope: Hashable,
+        decisions: tuple[Decision[EffectT], ...],
+        accumulated: list[Decision[EffectT]],
+        resolved_scopes: list[Hashable],
+    ) -> bool:
+        accumulated.extend(decisions)
+        if decisions:
+            resolved_scopes.append(scope)
+        return traversal.should_stop(decisions)
+
+    @staticmethod
+    def _record_scope_exit(
+        collector: TraceCollector,
+        scope: Hashable,
+        decisions: tuple[Decision[EffectT], ...],
+    ) -> None:
+        collector.emit(
+            "scope.exited",
+            attributes={
+                "scope": str(scope),
+                "decision_count": len(decisions),
+                "selected_rules": [
+                    decision.rule_id for decision in decisions
+                ],
+                "outcomes": [
+                    decision.outcome.value for decision in decisions
+                ],
+            },
+        )
 
     @staticmethod
     def _validate_result(rule_id: str, result: object) -> RuleResult[EffectT]:
@@ -317,11 +408,20 @@ class PolicyEngine(Generic[ContextT, EffectT]):
     @staticmethod
     def _complete(
         collector: TraceCollector,
-        decisions: tuple[Decision[EffectT], ...],
+        traversal: ScopeTraversalStrategy[EffectT],
+        result: _TraversalResult[EffectT],
     ) -> Execution[EffectT]:
+        decisions = result.decisions
         attributes: dict[str, JsonValue] = {
             "matched": bool(decisions),
             "decision_count": len(decisions),
+            "traversal_strategy": traversal.name,
+            "evaluated_scopes": [
+                str(scope) for scope in result.evaluated_scopes
+            ],
+            "resolved_scopes": [
+                str(scope) for scope in result.resolved_scopes
+            ],
         }
         if decisions:
             attributes.update(
